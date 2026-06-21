@@ -1,0 +1,138 @@
+services:
+  frontend:
+    build:
+      context: ./rag-ui
+      dockerfile: Dockerfile
+    container_name: rag_frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: biomedical_rag
+      POSTGRES_USER: rag_user
+      POSTGRES_PASSWORD: rag_password
+    ports:
+      # Host 5433 avoids collision with a native Windows PostgreSQL on 5432
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag_user -d biomedical_rag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: biomedical-rag-backend:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: rag_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      DATABASE_URL: postgresql+asyncpg://rag_user:rag_password@postgres:5432/biomedical_rag
+      REDIS_URL: redis://redis:6379/0
+      ALLOWED_ORIGINS: http://localhost:3000
+      EMBEDDING_PROVIDER: ollama
+      OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./vectorstore:/app/vectorstore
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  celery:
+    image: biomedical-rag-backend:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: rag_celery
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      DATABASE_URL: postgresql+asyncpg://rag_user:rag_password@postgres:5432/biomedical_rag
+      REDIS_URL: redis://redis:6379/0
+      CELERY_WORKER_POOL: prefork
+      EMBEDDING_PROVIDER: ollama
+      OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+    command: ["celery", "-A", "backend.tasks.celery_app", "worker", "--loglevel=info"]
+    volumes:
+      - ./data:/app/data
+      - ./vectorstore:/app/vectorstore
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: rag_ollama_init
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: llama3.2:3b
+      OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "sleep 8 &&
+      ollama pull $${OLLAMA_MODEL} &&
+      ollama pull $${OLLAMA_EMBEDDING_MODEL}"
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
