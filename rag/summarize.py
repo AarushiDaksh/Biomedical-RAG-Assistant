@@ -1,21 +1,19 @@
 import json
-from typing import List
+from typing import List, Tuple
 
+from .config import SUMMARY_CHAR_BUDGET
 from .retriever import get_document_chunks
 from .schemas import RAGAnswer, Citation, RetrievedChunk
-
-# ~6k tokens of context at ~4 chars/token leaves headroom under num_ctx=8192.
-STUFF_CHAR_BUDGET = 24_000
-GROUP_CHAR_BUDGET = 8_000
 
 SUMMARY_SYSTEM = """You are a biomedical literature assistant.
 Summarize the provided paper text faithfully. Do not use outside knowledge.
 Cover: aim, methods, key findings, and limitations.
 Return ONLY JSON: {"answer": "...", "confidence": "low|medium|high", "citations": []}"""
 
-REDUCE_SYSTEM = """Combine these partial summaries of ONE paper into a single coherent
-summary covering aim, methods, key findings, and limitations. No outside knowledge.
-Return ONLY JSON: {"answer": "...", "confidence": "low|medium|high", "citations": []}"""
+# Plain-prose variant used when the summary is streamed token-by-token to the UI.
+SUMMARY_STREAM_SYSTEM = """You are a biomedical literature assistant.
+Summarize the provided paper text faithfully using only that text — no outside knowledge.
+Cover: aim, methods, key findings, and limitations. Write clear prose for the user."""
 
 
 def _parse(raw: str) -> dict:
@@ -40,17 +38,35 @@ def _citations(chunks: List[RetrievedChunk]) -> List[Citation]:
     return cites
 
 
-def _groups(chunks: List[RetrievedChunk], budget: int) -> List[List[RetrievedChunk]]:
-    groups, cur, size = [], [], 0
+def _select_within_budget(chunks: List[RetrievedChunk], budget: int) -> str:
+    """Text for a single-call summary, capped to `budget` characters.
+
+    Short papers are passed whole. Long papers are sampled head + tail so the
+    summary still sees the abstract/intro/methods (start) and the
+    results/discussion/limitations (end), which is where summary-relevant
+    content lives — rather than truncating to just the first few pages.
+    """
+    full = "\n\n".join(c.text for c in chunks)
+    if len(full) <= budget:
+        return full
+
+    half = budget // 2
+    head, hsize = [], 0
     for c in chunks:
-        if size + len(c.text) > budget and cur:
-            groups.append(cur)
-            cur, size = [], 0
-        cur.append(c)
-        size += len(c.text)
-    if cur:
-        groups.append(cur)
-    return groups
+        if hsize + len(c.text) > half:
+            break
+        head.append(c.text)
+        hsize += len(c.text)
+
+    tail, tsize = [], 0
+    for c in reversed(chunks):
+        if tsize + len(c.text) > (budget - hsize):
+            break
+        tail.append(c.text)
+        tsize += len(c.text)
+    tail.reverse()
+
+    return "\n\n".join(head) + "\n\n[...]\n\n" + "\n\n".join(tail)
 
 
 async def _summarize_text(system: str, text: str, llm) -> str:
@@ -58,33 +74,27 @@ async def _summarize_text(system: str, text: str, llm) -> str:
     return _parse(raw).get("answer", "").strip()
 
 
-async def summarize_document(document_id: str, llm) -> RAGAnswer:
+def build_summary_request(document_id: str) -> Tuple[str, List[Citation]]:
+    """Return (capped_text, citations) for a single-call summary, or ("", [])."""
     chunks = get_document_chunks(document_id)
     if not chunks:
+        return "", []
+    return _select_within_budget(chunks, SUMMARY_CHAR_BUDGET), _citations(chunks)
+
+
+async def summarize_document(document_id: str, llm) -> RAGAnswer:
+    """Single-call summary over a character-capped slice of the paper.
+
+    Used directly for the summary intent (non-streamed callers) and by the
+    compare flow. Streaming summaries are produced in rag.agent.
+    """
+    text, cites = build_summary_request(document_id)
+    if not text:
         return RAGAnswer(answer="I have no indexed content for that paper.",
                          confidence="low", citations=[])
-
-    full = "\n\n".join(c.text for c in chunks)
-    cites = _citations(chunks)
-
-    if len(full) <= STUFF_CHAR_BUDGET:
-        answer = await _summarize_text(SUMMARY_SYSTEM, full, llm)
-        return RAGAnswer(answer=answer or "Could not summarize.",
-                         confidence="high" if answer else "low", citations=cites)
-
-    # Map-reduce: summarize groups, then combine. Tolerate partial failures.
-    groups = _groups(chunks, GROUP_CHAR_BUDGET)
-    partials = []
-    for group in groups:
-        try:
-            text = "\n\n".join(c.text for c in group)
-            partials.append(await _summarize_text(SUMMARY_SYSTEM, text, llm))
-        except Exception:
-            continue
-    if not partials:
-        return RAGAnswer(answer="Summarization failed for this paper.",
-                         confidence="low", citations=cites)
-    combined = await _summarize_text(REDUCE_SYSTEM, "\n\n".join(partials), llm)
-    confidence = "medium" if len(partials) >= (len(groups) + 1) // 2 else "low"
-    return RAGAnswer(answer=combined or "\n\n".join(partials),
-                     confidence=confidence, citations=cites)
+    try:
+        answer = await _summarize_text(SUMMARY_SYSTEM, text, llm)
+    except Exception:
+        answer = ""
+    return RAGAnswer(answer=answer or "Could not summarize this paper.",
+                     confidence="high" if answer else "low", citations=cites)

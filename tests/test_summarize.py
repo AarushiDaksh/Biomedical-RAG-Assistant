@@ -7,9 +7,11 @@ from rag.schemas import RetrievedChunk
 class FakeLLM:
     def __init__(self):
         self.calls = 0
+        self.last_user_text = ""
 
     async def ainvoke(self, messages):
         self.calls += 1
+        self.last_user_text = messages[-1][1]
         return MagicMock(content='{"answer": "a summary", "confidence": "high", "citations": []}')
 
 
@@ -30,12 +32,29 @@ def test_stuff_path_single_llm_call(monkeypatch):
     assert ans.answer == "a summary"
 
 
-def test_map_reduce_path_multiple_calls(monkeypatch):
-    # 40 chunks * 2000 chars = 80k chars >> STUFF_CHAR_BUDGET -> map-reduce
+def test_large_doc_single_capped_call(monkeypatch):
+    # 40 chunks * 2000 chars = 80k chars >> SUMMARY_CHAR_BUDGET. The whole paper
+    # must still be summarized in ONE call, over a character-capped slice.
+    from rag.config import SUMMARY_CHAR_BUDGET
     monkeypatch.setattr(summarize, "get_document_chunks", lambda d: _chunks(40, 2000))
     llm = FakeLLM()
     ans = _run(summarize.summarize_document("d1", llm))
-    assert llm.calls > 1
+    assert llm.calls == 1
+    assert ans.answer == "a summary"
+    # Capped near budget (small margin for chunk-join separators), not the full 80k.
+    assert len(llm.last_user_text) <= SUMMARY_CHAR_BUDGET + 100
+
+
+def test_large_doc_samples_head_and_tail(monkeypatch):
+    # Distinct head/tail text so we can prove both ends reach the summary.
+    chunks = _chunks(40, 2000)
+    chunks[0].text = "HEAD_MARKER " + chunks[0].text
+    chunks[-1].text = "TAIL_MARKER " + chunks[-1].text
+    monkeypatch.setattr(summarize, "get_document_chunks", lambda d: chunks)
+    llm = FakeLLM()
+    _run(summarize.summarize_document("d1", llm))
+    assert "HEAD_MARKER" in llm.last_user_text
+    assert "TAIL_MARKER" in llm.last_user_text
 
 
 def test_empty_document(monkeypatch):
@@ -58,10 +77,10 @@ class FlakyLLM:
         return MagicMock(content='{"answer": "partial summary", "confidence": "high", "citations": []}')
 
 
-def test_map_reduce_tolerates_partial_failures(monkeypatch):
-    # 40 chunks * 2000 chars = 80k chars >> STUFF_CHAR_BUDGET -> map-reduce
-    # 80k / 8k GROUP_CHAR_BUDGET = 10 groups; fail_first=3 -> 7 groups succeed + reduce call
-    monkeypatch.setattr(summarize, "get_document_chunks", lambda d: _chunks(40, 2000))
-    llm = FlakyLLM(fail_first=3)
+def test_summarize_handles_llm_failure(monkeypatch):
+    # A failing LLM call must degrade gracefully, not crash the request.
+    monkeypatch.setattr(summarize, "get_document_chunks", lambda d: _chunks(3, 500))
+    llm = FlakyLLM(fail_first=1)
     ans = _run(summarize.summarize_document("d1", llm))
-    assert ans.answer  # non-empty; did not crash
+    assert ans.answer  # non-empty fallback message
+    assert ans.confidence == "low"

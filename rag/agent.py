@@ -5,29 +5,72 @@ from typing import AsyncIterator
 
 from langchain_ollama import ChatOllama
 
-from .config import OLLAMA_BASE_URL, OLLAMA_MODEL, TOP_K
+from .config import (
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    LLM_PROVIDER,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
+    TOP_K,
+)
 from .retriever import retrieve_chunks
 from .guardrails import check_input
 from .schemas import RAGAnswer, Citation, RetrievedChunk
 from .intent import classify_intent
-from .summarize import summarize_document
+from .summarize import build_summary_request, summarize_document, SUMMARY_STREAM_SYSTEM
 from .compare import compare_documents
 
 # ── Singleton LLM ─────────────────────────────────────────────────────────────
-_llm: ChatOllama | None = None
+_llm = None
 
 
-def get_llm() -> ChatOllama:
+def get_llm():
+    """Return a singleton chat model. All prompts emit JSON, so JSON mode is enforced.
+
+    LLM_PROVIDER=groq  -> hosted Groq (fast, high quality; chat only)
+    LLM_PROVIDER=ollama -> local Ollama (private, runs offline)
+    """
     global _llm
     if _llm is None:
-        _llm = ChatOllama(
-            model=OLLAMA_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0,
-            format="json",
-            num_ctx=8192,
-        )
+        if LLM_PROVIDER == "groq":
+            from langchain_groq import ChatGroq
+
+            _llm = ChatGroq(
+                model=GROQ_MODEL,
+                api_key=GROQ_API_KEY,
+                temperature=0,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+        else:
+            _llm = ChatOllama(
+                model=OLLAMA_MODEL,
+                base_url=OLLAMA_BASE_URL,
+                temperature=0,
+                format="json",
+                num_ctx=8192,
+            )
     return _llm
+
+
+# Separate model WITHOUT JSON mode, used to stream the QA answer as plain prose.
+_stream_llm = None
+
+
+def get_stream_llm():
+    global _stream_llm
+    if _stream_llm is None:
+        if LLM_PROVIDER == "groq":
+            from langchain_groq import ChatGroq
+
+            _stream_llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0)
+        else:
+            _stream_llm = ChatOllama(
+                model=OLLAMA_MODEL,
+                base_url=OLLAMA_BASE_URL,
+                temperature=0,
+                num_ctx=8192,
+            )
+    return _stream_llm
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
@@ -53,6 +96,24 @@ Return exactly this JSON:
     }
   ]
 }"""
+
+
+# Streaming variant: prose answer first (streamed token-by-token to the UI),
+# then a metadata sentinel + single-line JSON for confidence and citations.
+STREAM_MARKER = "###META###"
+STREAM_SYSTEM_PROMPT = """You are a Biomedical Literature RAG Assistant.
+
+Rules:
+1. Answer ONLY from the retrieved context provided below. Never use outside knowledge.
+2. Do not give personal clinical advice or diagnoses.
+3. If the context is insufficient, answer exactly: "I could not find this in the uploaded papers."
+4. Cite only chunk_ids that appear in the context.
+
+Write the answer as clear prose for the user. When the answer is complete, output a
+new line containing exactly:
+###META###
+immediately followed by a single-line JSON object and nothing after it:
+{"confidence": "low|medium|high", "citations": [{"title": "...", "document_id": "...", "page_number": 1, "chunk_id": "..."}]}"""
 
 
 def _build_context(chunks: list[RetrievedChunk]) -> str:
@@ -170,8 +231,25 @@ async def answer_question_stream(question: str, history: list | None = None,
             yield _done("Upload and select a paper first, then ask me to summarize it.",
                         "low", [], [], trace_id, start)
             return
-        ans = await summarize_document(target, llm)
-        yield _done(ans.answer, ans.confidence, _cites(ans), [], trace_id, start)
+        text, cites = build_summary_request(target)
+        if not text:
+            yield _done("I have no indexed content for that paper.",
+                        "low", [], [], trace_id, start)
+            return
+        # Single streamed call over the capped slice (no map-reduce).
+        stream_llm = get_stream_llm()
+        parts = []
+        async for piece in stream_llm.astream([("system", SUMMARY_STREAM_SYSTEM),
+                                               ("user", text)]):
+            delta = piece.content or ""
+            if delta:
+                parts.append(delta)
+                yield {"type": "token", "text": delta}
+        answer = "".join(parts).strip()
+        cite_payload = [{"title": c.title, "document_id": c.document_id,
+                         "page_number": c.page_number, "chunk_id": c.chunk_id} for c in cites]
+        yield _done(answer or "Could not summarize this paper.",
+                    "high" if answer else "low", cite_payload, [], trace_id, start)
         return
 
     # intent == "qa"
@@ -187,10 +265,41 @@ async def answer_question_stream(question: str, history: list | None = None,
     user_prompt = (
         f"{_history_block(history)}"
         f"Question:\n{question}\n\nRetrieved Context:\n{context}\n\n"
-        "Answer using only the retrieved context. Return JSON only."
+        "Answer using only the retrieved context."
     )
-    raw = (await llm.ainvoke([("system", SYSTEM_PROMPT), ("user", user_prompt)])).content
-    answer_obj = enforce_citations(_build_answer(_safe_json_parse(raw)))
+
+    # Stream prose tokens to the UI; withhold the trailing metadata block.
+    stream_llm = get_stream_llm()
+    full, emitted, marker_idx = "", 0, -1
+    async for piece in stream_llm.astream([("system", STREAM_SYSTEM_PROMPT),
+                                           ("user", user_prompt)]):
+        full += piece.content or ""
+        if marker_idx == -1:
+            marker_idx = full.find(STREAM_MARKER)
+        if marker_idx != -1:
+            if marker_idx > emitted:
+                yield {"type": "token", "text": full[emitted:marker_idx]}
+                emitted = marker_idx
+        else:
+            # Hold back the last len(marker) chars so we never emit a partial marker.
+            safe = len(full) - len(STREAM_MARKER)
+            if safe > emitted:
+                yield {"type": "token", "text": full[emitted:safe]}
+                emitted = safe
+
+    if marker_idx == -1:
+        if len(full) > emitted:
+            yield {"type": "token", "text": full[emitted:]}
+        answer_text, meta = full.strip(), {}
+    else:
+        answer_text = full[:marker_idx].strip()
+        meta = _safe_json_parse(full[marker_idx + len(STREAM_MARKER):])
+
+    answer_obj = enforce_citations(_build_answer({
+        "answer": answer_text or "I could not generate an answer.",
+        "confidence": meta.get("confidence", "medium" if answer_text else "low"),
+        "citations": meta.get("citations", []),
+    }))
     yield _done(answer_obj.answer, answer_obj.confidence, _cites(answer_obj),
                 _chunk_payload(chunks), trace_id, start)
 

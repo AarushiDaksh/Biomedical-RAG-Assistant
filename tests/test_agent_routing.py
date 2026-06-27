@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import MagicMock
 import rag.agent as agent
 from rag.schemas import RAGAnswer
 
@@ -11,23 +12,31 @@ async def _collect(gen):
     return [e async for e in gen]
 
 
-def test_summary_intent_routes_to_summarize(monkeypatch):
+def test_summary_intent_streams_summary(monkeypatch):
     async def fake_classify(q, h, llm):
         return "summary"
     monkeypatch.setattr(agent, "classify_intent", fake_classify)
 
     called = {}
 
-    async def fake_summarize(doc_id, llm):
+    def fake_build(doc_id):
         called["doc"] = doc_id
-        return RAGAnswer(answer="S", confidence="high", citations=[])
-    monkeypatch.setattr(agent, "summarize_document", fake_summarize)
+        return "paper text", []
+    monkeypatch.setattr(agent, "build_summary_request", fake_build)
+
+    class FakeStreamLLM:
+        async def astream(self, messages):
+            for tok in ["Sum", "mary"]:
+                yield MagicMock(content=tok)
+    monkeypatch.setattr(agent, "get_stream_llm", lambda: FakeStreamLLM())
 
     events = _run(_collect(agent.answer_question_stream(
         "summarize it", history=[], document_ids=["dX"])))
+    tokens = [e for e in events if e["type"] == "token"]
     done = [e for e in events if e["type"] == "done"][-1]
-    assert done["answer"] == "S"
     assert called["doc"] == "dX"
+    assert done["answer"] == "Summary"
+    assert len(tokens) == 2
 
 
 def test_qa_intent_with_no_chunks(monkeypatch):

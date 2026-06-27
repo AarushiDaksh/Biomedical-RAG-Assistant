@@ -126,10 +126,12 @@ services:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: llama3.2:3b
       OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+      # Skip pulling the local chat model when Groq handles generation.
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
     entrypoint: ["/bin/sh", "-c"]
     command: >
       "sleep 8 &&
-      ollama pull $${OLLAMA_MODEL} &&
+      if [ x$${LLM_PROVIDER} != xgroq ]; then ollama pull $${OLLAMA_MODEL}; fi &&
       ollama pull $${OLLAMA_EMBEDDING_MODEL}"
 
 volumes:

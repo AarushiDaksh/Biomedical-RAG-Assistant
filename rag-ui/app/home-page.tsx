@@ -471,6 +471,7 @@ export default function HomePage() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let streamId: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -489,17 +490,36 @@ export default function HomePage() {
             const event = JSON.parse(raw);
             if (event.type === "status") {
               setStatusText(event.message);
+            } else if (event.type === "token") {
+              setStatusText("");
+              const delta = event.text ?? "";
+              if (!streamId) {
+                streamId = `a-${Date.now()}`;
+                const id = streamId;
+                setMessages((prev) => [...prev, { id, role: "assistant", text: delta }]);
+              } else {
+                const id = streamId;
+                setMessages((prev) => prev.map((m) =>
+                  m.id === id ? { ...m, text: m.text + delta } : m));
+              }
             } else if (event.type === "done") {
               setStatusText("");
-              setMessages((prev) => [...prev, {
-                id: `a-${Date.now()}`,
-                role: "assistant",
+              const final = {
                 text: event.answer,
-                citations: event.citations ?? [],
+                citations: (event.citations ?? []) as Citation[],
                 confidence: event.confidence as Confidence,
                 traceId: event.trace_id,
                 latency: event.latency,
-              }]);
+              };
+              if (streamId) {
+                const id = streamId;
+                setMessages((prev) => prev.map((m) =>
+                  m.id === id ? { ...m, ...final } : m));
+              } else {
+                setMessages((prev) => [...prev, {
+                  id: `a-${Date.now()}`, role: "assistant", ...final,
+                }]);
+              }
             }
           } catch {}
         }
